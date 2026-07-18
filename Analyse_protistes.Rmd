@@ -1,0 +1,1589 @@
+
+#analyse de données de métabarcoding 18S
+
+
+#Différents packages utilisés
+```{r}
+library(magrittr)
+library(lme4)
+#library(factoextra)
+library(ggplot2)
+library(ggpubr)
+library(grid)
+library(vegan)
+library(dplyr)
+library(scales)
+library(grid)
+library(reshape2)
+library(phyloseq)
+#devtools::install_github("gauravsk/ranacapa")
+#library(ranacapa)
+#library(RColorBrewer)
+#library(randomcoloR)
+#library(cowplot)
+#library(rstatix)
+#library(RADanalysis)
+library(permute)
+#remotes::install_github("microsud/microbiomeutilities")
+library(microbiomeutilities)
+library(microbiome)
+#library(tibble)
+#library(knitr)
+#library(nlme)
+library(data.table)
+#library(readstata13)
+library(tidyverse)
+#library(randomForest)
+#library(hrbrthemes)
+#library(gcookbook)
+#library(ggConvexHull)
+#library(ggnewscale)
+#library(plyr)
+#library(ggrepel)
+#library(corrplot)
+#library(ape)
+#library(gridExtra)
+#library(stringr)
+#library(UpSetR)
+#library(viridis)
+#library(ComplexHeatmap)
+remotes::install_github("microsud/microbiomeutilities")
+```
+
+#importation de la table d'ASV et de la table taxonomique
+
+```{r}
+ASVariant<-read.csv("/Users/dores/OneDrive/Desktop/Memoire M2/Analyse_de_données_stage_M2/data/sequence_table_pr2.csv",sep=";")
+Taxonomy<-read.csv("/Users/dores/OneDrive/Desktop/Memoire M2/Analyse_de_données_stage_M2/data/taxonomy_table_pr2.csv",sep=";")
+```
+
+Après l'assignation taxonomique, on se rend compte que il y'a des séquences non assignés et ces NA ne sont pas intéressantes pour le reste des analyses parcequ'on ne sert pas à quoi elle correspond. la première étape est de voir la proportion de ces NA à chaque niveau taxonomique, de voir quel est le rang le plus assignés et de le prendre en compte pour le reste de l'analyse.
+
+
+#Transformation de tout les taxons non identifiés en NA (par exemple Evesoa_X en NA)
+
+```{r}
+Taxonomy[] <- lapply(Taxonomy, function(x) {
+
+  # Remplacer les taxons finissant par _X, _XX, _XXX...
+  x[grepl("_X+$", x)] <- NA
+
+  # Remplacer X, XX, XXX seuls
+  x[grepl("^X+$", x)] <- NA
+
+  return(x)
+})
+```
+
+#Determiner le pourcentage des NA qui correspond au taxons non identifié et voir quel est le niveau taxonomique le plus identifié et voir si cela va etre utilisé pour la suite des analyses.
+
+```{r}
+# Calcul du pourcentage de NA par colonne taxonomique
+
+resume_taxo <- data.frame(
+  Niveau = colnames(Taxonomy),
+  
+  Nb_total = sapply(Taxonomy, length),
+  
+  Nb_NA = sapply(Taxonomy, function(x) sum(is.na(x))),
+  
+  Nb_identifies = sapply(Taxonomy, function(x) sum(!is.na(x)))
+)
+
+# Pourcentages
+resume_taxo$Pourcent_NA <- round(
+  (resume_taxo$Nb_NA / resume_taxo$Nb_total) * 100,
+  2
+)
+
+resume_taxo$Pourcent_identifies <- round(
+  (resume_taxo$Nb_identifies / resume_taxo$Nb_total) * 100,
+  2
+)
+
+resume_taxo
+```
+
+```{r}
+resume_taxo <- resume_taxo[-c(1,11,12), ]
+
+```
+
+
+```{r}
+library(ggplot2)
+
+resume_taxo$Niveau <- factor(
+  resume_taxo$Niveau,
+  levels = c(
+    "Domain",
+    "Supergroup",
+    "Division",
+    "Class",
+    "Class",
+    "Order",
+    "Family",
+    "Genus",
+    "Species"
+  )
+)
+
+ggplot(resume_taxo,
+       aes(x = Niveau,
+           y = Pourcent_NA)) +
+
+  geom_bar(stat = "identity",
+           fill = "grey40") +
+
+  theme_bw() +
+
+  ylab("% de taxons non identifiés") +
+
+  xlab("Rang taxonomique") +
+
+  ggtitle("Qualité de l’assignation taxonomique") +
+
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1)
+    )
+```
+
+#Ensuite, reimporter la table d'assignation taxomique
+
+```{r}
+write.table(Taxonomy,
+            file = "C:/Users/dores/OneDrive/Desktop/Memoire M2/Analyse_de_données_stage_M2/data/Taxonomy2.csv",
+            sep = ";",
+            quote = FALSE,
+            col.names = NA)
+```
+
+#Définition du dossier de travail
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "c:/Users/dores/OneDrive/Desktop/Memoire M2/Analyse_de_données_stage_M2/data/protistes")
+
+getwd()
+```
+
+#Import des tables d'abondance d'ASV, de taxonomie et des métadonnées
+```{r}
+taxoFile="Taxonomy2.csv"
+ASVFile="ASV_table.csv"
+```
+
+```{r}
+ASV_data = read.csv(ASVFile, sep =";")
+rownames(ASV_data) = ASV_data[,1]
+ASV_data = ASV_data[,-c(1)]
+```
+Ces lignes de code permettent d'importer la table de taxonomique ou d'ASV, prends toute les noms de lignes et supprime ces noms.
+
+#suppression des échantillons qui ne nous intéressent pas pour chaque analyse.
+puisque on a analysé les sites où il y'avait prunella vulgaris à part et ou il y'avait le géranium à part afin d'avoir le meme nombre d'échantillon sur chaque site, il faut donc en foncction de l'espèce à analyser supprimer l'autre.
+
+```{r}
+samples_to_remove <- c(
+  paste0("SVG_", 1:20),
+  paste0("SEG_", 1:20),
+  paste0("SJG_", 1:20)
+)
+
+# Suppression des colonnes
+ASV_data <- ASV_data[
+  , !colnames(ASV_data) %in% samples_to_remove
+]
+
+```
+Dans ce cas, les échantillons de Geranium sont supprimés et on va juste analyser prunella.
+
+```{r}
+taxo_data = read.csv(taxoFile, sep =";",row.names = 1,
+  check.names = FALSE)
+rownames(taxo_data) = taxo_data[,1]
+taxo_data = taxo_data[,-c(1)]
+taxo_data = as.matrix(taxo_data)
+```
+Ces lignes de code permettent d'importer la table de taxonomique ou d'ASV, prends toute les noms de lignes et supprime ces noms.
+
+#création de l'objet phyloseq
+
+Un objet phyloseq est une structure S4 de R qui regroupe toutes les données nécessaires pour analyser un jeu de données de séquençage amplicon (OTU/ASV) dans un seul conteneur cohérent. il regroupe la table taxonomique, d'abondance d'ASV et des métadonnées.
+
+```{r}
+ASV = otu_table(ASV_data, taxa_are_rows = TRUE)
+TAXO = tax_table(taxo_data)
+Objet_phyloseq = phyloseq(ASV, TAXO)
+```
+
+#import des métadonnées et formatage dans un format acceptable par phyloseq et fusion avec le premier objet phyloseq composé de la table taxo et de l'abondance en ASV
+
+```{r}
+metadata = read.csv("metadata_Prunella.csv", sep =";")
+# Ajouter underscore dans la colonne des IDs
+metadata[,1] <- gsub("^([A-Za-z]+)([0-9]+)$", "\\1_\\2", metadata[,1])
+metadata[,1] = as.factor(metadata[,1])
+rownames(metadata) <- metadata[,1]
+metadata = metadata[,-c(1)]
+metadata = sample_data(metadata)
+```
+
+#création de l'objet phyloseq 2 contenant la table d'abondance d'ASV, la taxonomie et les métadonnées
+
+```{r}
+Objet_phyloseq2 = merge_phyloseq(Objet_phyloseq, metadata)
+Objet_phyloseq2
+
+```
+
+#controle qualité des données de séquencage et nettoyage des données
+
+##profondeur de séquencage par échantillons
+
+```{r}
+sort(sample_sums(Objet_phyloseq2))
+seq_sums <- sort(sample_sums(Objet_phyloseq2))
+seq_sums_df <- data.frame(Sample = names(seq_sums), TotalReads = seq_sums)
+write.csv(seq_sums_df, "sequence_sums_per_sample.csv", row.names = FALSE)
+```
+
+Elle permet de voir le nombre de séquences par échantillon afin de voir les échantillons pauvres, riches et ainsi définir comment est ce que la rarefaction se fera.
+Ensuite faire un histogramme afin de visualiser cela.
+
+```{r}
+df_reads <- data.frame(
+  SampleID = names(sample_sums(Objet_phyloseq2)),
+  Reads = sample_sums(Objet_phyloseq2)
+)
+```
+
+```{r}
+ggplot(df_reads, aes(x = Reads)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = 1000, color = "red", linetype = "dashed", linewidth = 1) +
+  theme_bw() +
+  labs(
+    title = "Distribution du nombre de reads par échantillon",
+    x = "Nombre de reads",
+    y = "Nombre d’échantillons"
+  )
+```
+
+```{r}
+summary(df_reads)
+```
+Le nombre de reads minimal dans l'ensemble des éhantillons est de 118792 et le maximum est de 426561
+
+##renommage des rangs taxonomiques
+
+```{r}
+colnames(tax_table(Objet_phyloseq2)) <- c("Domain", "Supergroup","Division", "Class","Class","Order", "Family", "Genus", 
+                                     "Species")[1:length(rank_names(Objet_phyloseq2))]
+```
+
+##filtrage des taxons qui ne sont pas intéressantes pour l'étude
+Il s'agit des taxons non assignées, les bactéries, les chloroplastes, les mitochondries, les fungi(tous les champignons), les Rhodophyta(Algues rouges multicellulaire) et les Streptophyta(Plantes), les chlorophytes.
+
+```{r}
+Gooddata_rem <- Objet_phyloseq2 %>%
+  subset_taxa(
+    Domain != "Unassigned" &
+      Domain != "Bacteria" &
+      Supergroup != "Eukaryota_X" &
+      Family != "Mitochondria" &
+      Class !="Chloroplast"&
+      Class!="Metazoa"&
+      Class != "Fungi"&
+      Class != "Chlorophyta_X"&
+      Division!="Streptophyta"&
+      Division!="Rhodophyta"
+  )
+```
+
+##refaire le nombre de reads par échantillon et cela constituera un résultat pour le rapport.
+
+```{r}
+df_reads2 <- data.frame(
+  SampleID = names(sample_sums(Gooddata_rem)),
+  Reads = sample_sums(Gooddata_rem)
+)
+```
+
+
+```{r}
+ggplot(df_reads2, aes(x = Reads)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "black") +
+  geom_vline(xintercept = 1000, color = "red", linetype = "dashed", linewidth = 1) +
+  theme_bw() +
+  labs(
+    title = "Distribution du nombre de reads par échantillon",
+    x = "Nombre de reads",
+    y = "Nombre d’échantillons"
+  )
+```
+
+```{r}
+summary(df_reads2)
+```
+Après néttoyage de toutes les séquences "non protistes", le nombre minimums de reads est de 16927 et le maximum est de 136202
+
+Exportation de la figure
+```{r}
+ggsave( filename = "mon.png", plot = a, width = 8, height = 5, units = "in", dpi = 300 )
+```
+
+La fonction print_ps permet de lister le contenue d'un objet phyloseq
+
+```{r}
+print_ps(Gooddata_rem)
+```
+Dans les données on a 2048 singlétons. A partir de ces singlétons, c'est possible de faire l'indice de Shao1 puiqu'il a besoin de singletons et de doubletons dans ses calculs.
+la sparsité permet de voir le niveau d'hétérogénéité des données
+
+##installation du package microbiomeutilities
+```{r}
+install.packages("devtools")
+devtools::install_github("microsud/microbiomeutilities")
+
+```
+
+##nombre de reaads par échantillons
+Après avoir vu le nombre de reads dans l'ensemble des données, on verra actuellement le nombre de reads dans chaque échantillons afin de voir les échantillons qui contiennent moins ou plus de reads.
+
+```{r}
+df_reads2$SampleID <- factor(df_reads2$SampleID, levels = df_reads2$SampleID[order(df_reads2$Reads)])
+
+# Plot avec noms visibles
+pdf("samplesequeningdepthfiltration.pdf", #name of file to print. 
+    width = 12, # define plot width and height. completely up to user.
+    height = 10)
+sampledepthfil<-ggplot(df_reads2, aes(x = SampleID, y = Reads)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6)) + # rotation et taille
+  labs(title = "Nombre de reads par échantillon après filtration",
+       x = "Samples",
+       y = "Number of reads")
+sampledepthfil
+dev.off()
+ggsave(filename = "sampledepthfiltration_3.png", plot = sampledepthfil, device = "png", width = 12, height = 10)
+
+```
+
+
+```{r}
+
+#joined figures
+
+pdf("Depth_av_ap.pdf", 
+    width = 10, 
+    height = 12)
+plot_grid(sampledepthfil,
+          labels=c("A", "B"), ncol = 1, nrow = 2)
+dev.off()
+```
+
+
+#Normalisation des données
+Dans cet analyse, les données seront normalisés en utilisant deux méthodes: la méthode de raréfaction et la méthode CSS. la raréfaction va etre utilisée pour le cacul des diversités béta et la méthode CSS pour le calcul des diversités Béta.
+la méthode CSs permet de perdre moins de données par rapport à la méthode de rarefaction.
+
+#installation du package metagebomeseq qui permet de faire la normalisation CSS(cumulative sum scaling)
+```{r}
+#install.packages("BiocManager")
+#BiocManager::install("metagenomeSeq")
+
+library(metagenomeSeq)
+```
+
+```{r}
+#Conversion
+mgseq <- phyloseq_to_metagenomeSeq(Gooddata_rem)
+
+# Calcul du paramètre de normalisation
+p <- cumNormStatFast(mgseq)
+mgseq <- cumNorm(mgseq, p = p)
+
+# Extraction des données normalisées
+norm_counts <- MRcounts(mgseq, norm = TRUE, log = FALSE)
+
+# Creation du nouvel objet phyloseq
+Gooddata_CSS <- Gooddata_rem
+otu_table(Gooddata_CSS) <- otu_table(norm_counts, taxa_are_rows = TRUE)
+
+# Vérification
+sort(sample_sums(Gooddata_CSS))  # Maintenant normalisé !
+Gooddata <-Gooddata_CSS
+print_ps(Gooddata)
+```
+
+
+```{r}
+print_ps(Gooddata)
+```
+Question: pourquoi après avoir fait la normalisation le nombre de singlétons augmente?
+On se rend compte aussi que le % contenant les singlétons après la rarefaction est égal à zéro.
+
+#vue globale de la diversité taxonomique, 
+voir le nombre de taxons uniques présents à chaque niveau taxonomique
+
+```{r}
+dfEukaryota = subset_taxa(Gooddata, Domain=="Eukaryota")
+get_taxa_unique(dfEukaryota, "Supergroup") 
+get_taxa_unique(dfEukaryota, "Division")
+get_taxa_unique(dfEukaryota, "Class") 
+get_taxa_unique(dfEukaryota, "Class") 
+get_taxa_unique(dfEukaryota, "Order")
+get_taxa_unique(dfEukaryota, "Family")
+get_taxa_unique(dfEukaryota, "Genus")
+get_taxa_unique(dfEukaryota, "Species")
+```
+
+```{r}
+# Liste des niveaux taxonomiques
+tax_ranks <- c("Supergroup", "Division", "Class",
+               "Class", "Order", "Family", "Genus", "Species")
+
+# Boucle pour exporter chaque niveau en CSV
+for (rank in tax_ranks) {
+  
+  taxa_values <- get_taxa_unique(dfEukaryota, rank)
+  
+  # Convertir en data.frame
+  taxa_df <- data.frame(Value = taxa_values)
+  
+  # Écriture du fichier CSV
+  write.csv(taxa_df,
+            file = paste0("Taxa_unique_", rank, ".csv"),
+            row.names = FALSE)
+}
+```
+
+```{r}
+length(taxa_values)
+```
+
+#abondance relative
+
+Cette partie permet de décrire les différents taxons présent et à quel proportion à diférent niveau taxonomique, 
+
+#installation du package microbiome
+```{r}
+install.packages("BiocManager")
+BiocManager::install("microbiome")
+```
+
+#transformation des abondances absolues en abondance relative (proportions)
+
+```{r}
+ps2.rel <- microbiome::transform(Gooddata, "compositional")
+```
+
+
+#regroupement taxonomique 
+ceci permet de classer les asv des memes taxons ensemble, faire ceci pour les différents niveaux taxonomiques.pour l'abondance relative, on va travailler au niveau du rang classe.
+on a travailler au niveau class parceque c'était le rang où on avait le moins de NA.
+
+```{r}
+ps2.Class.rel <- tax_glom(physeq = ps2.rel, taxrank = "Class", NArm = FALSE)
+```
+
+#Gestion des noms manquants, faire également cela pour tout les autres niveaux taxonomiques.
+
+```{r}
+Class <- as.character(tax_table(ps2.Class.rel)[, "Class"])
+Class[is.na(Class)] <- "Unclassified Class"
+taxa_names(ps2.Class.rel) <- make.unique(Class)
+```
+
+#transformation de la table en format long pour effectuer les analyses de diversité alpha et béta
+
+```{r}
+ps2.Class.rel.df <- data.table(psmelt(ps2.Class.rel))
+```
+
+#regroupement des taxons abondants et regarder en fonctions des variables (espèces, sites)
+
+```{r}
+colnames(ps2.Class.rel.df)
+```
+
+#Classes dominantes en fonction de l'abondance relative pour la variable site
+
+```{r}
+library(data.table)
+library(ggplot2)
+
+# Somme totale d'abondance par Class
+Class_totals <- ps2.Class.rel.df[
+  ,
+  .(TotalAbundance = sum(Abundance, na.rm = TRUE)),
+  by = Class
+][order(-TotalAbundance)]
+
+# Garder les 10 plus abondantes
+top10_Class <- Class_totals$Class[1:10]
+
+top10_Class
+
+```
+
+```{r}
+ps2.Class.rel.df[
+  ,
+  Class_plot := ifelse(
+    Class %in% top10_Class,
+    as.character(Class),
+    "Autres"
+  )
+]
+```
+
+```{r}
+Class_summary <- ps2.Class.rel.df[
+  ,
+  .(Abundance = sum(Abundance, na.rm = TRUE)),
+  by = .(Sample, Class_plot, Espece, Site)
+]
+```
+
+```{r}
+ggplot(Class_summary,
+       aes(x = Sample,
+           y = Abundance,
+           fill = Class_plot)) +
+
+  geom_bar(stat = "identity",
+           color = "white",
+           size = 0.15) +
+
+  facet_wrap(~ Site,
+             scales = "free_x") +
+
+  theme_bw() +
+
+  labs(
+    title = "Classes dominantes selon le site",
+    x = "Échantillons",
+    y = "Abondance relative",   fill = "Class"
+  ) +
+
+  # Palette plus lisible
+  scale_fill_brewer(palette = "Paired") +
+
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      size = 8,
+      vjust = 0.5
+    ),
+
+    panel.grid = element_blank(),
+
+    strip.text = element_text(
+      face = "bold",
+      size = 12
+    )
+  )
+```
+
+#Classs dominantes en fonction de l'abondance relative pour la variable site
+
+```{r}
+couleurs_classes <- c(
+  "Autres" = "#A6CEE3",
+  "Chrysophyceae" = "#1F78B4",
+  "Colpodea" = "#B2DF8A",
+  "Endomyxa" = "#33A02C",
+  "Endomyxa-Phytomyxea" = "#FB9A99",
+  "Filosa-Imbricatea" = "#E31A1C",
+  "Filosa-Sarcomonadea" = "#FDBF6F",
+  "Filosa-Thecofilosea" = "#FF7F00",
+  "Gregarinomorphea" = "#CAB2D6",
+  "Peronosporomycetes" = "#6A3D9A",
+  "Sagenista" = "#A65628",
+  "Spirotrichea" = "#FFFF99"
+)
+```
+
+
+```{r}
+ggplot(class_summary,
+       aes(x = Sample,
+           y = Abundance,
+           fill = class_plot)) +
+
+  geom_bar(stat = "identity",
+           color = "white",
+           size = 0.15) +
+
+  facet_wrap(~ Site,
+             scales = "free_x") +
+
+  theme_bw() +
+
+  labs(
+    title = "Classes dominantes selon le site",
+    x = "Échantillons",
+    y = "Abondance relative",
+    fill = "Classe"
+  ) +
+
+  scale_fill_manual(
+    values = couleurs_classes,
+    drop = FALSE
+  ) +
+
+  theme(
+    axis.text.x = element_text(
+      angle = 90,
+      size = 8,
+      vjust = 0.5
+    ),
+    panel.grid = element_blank(),
+    strip.text = element_text(
+      face = "bold",
+      size = 12
+    )
+  )
+```
+
+
+#Représentation des 10 Classes les plus abondantes en fonction des sites sous forme de boxplot
+```{r}
+# 1. Transformation en abondance relative
+ps_rel <- microbiome::transform(Gooddata, "compositional")
+
+# 2. Agrégation au niveau du genre
+ps_Class <- tax_glom(ps_rel, taxrank = "Class", NArm = FALSE)
+
+# 3. Conversion en dataframe long
+df_Class <- data.table(psmelt(ps_Class))
+
+# 4. Remplacer les NA de genre
+df_Class$Class <- as.character(df_Class$Class )
+df_Class$Class [is.na(df_Class$Class ) | df_Class$Class  == ""] <- "Unclassified"
+
+# 5. Calcul des 10 genres les plus abondants
+top10_Class <- df_Class[
+  ,
+  .(TotalAbundance = sum(Abundance, na.rm = TRUE)),
+  by = Class
+][order(-TotalAbundance)][1:10]$Class
+
+# 6. Garder seulement ces 10 genres
+df_top10 <- df_Class[Class %in% top10_Class]
+
+# 7. Optionnel : ordonner les facettes selon l’abondance totale
+Class_order <- df_Class[
+  Class %in% top10_Class,
+  .(TotalAbundance = sum(Abundance, na.rm = TRUE)),
+  by = Class
+][order(-TotalAbundance)]$Class
+
+df_top10$Class <- factor(df_top10$Class, levels = Class_order)
+
+
+# 8. Boxplots facettés
+
+ggplot(df_top10, aes(x = Site, y = Abundance, fill = Site)) +
+  geom_boxplot(outlier.size = 0.8) +
+  facet_wrap(~ Class, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Abondance relative des 10 Classs dominantes selon le site",
+    x = "Site",
+    y = "Abondance relative"
+  ) +
+  theme(
+    plot.title = element_text(size = 13, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 10, face = "bold"),
+    axis.text = element_text(size = 5),
+    strip.text = element_text(size = 6, face = "bold"),
+    legend.position = "right"
+  ) +
+  stat_compare_means(
+    method = "kruskal.test",
+    label = "p.signif"
+  )+
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.format",
+    label.y.npc = 0.98,
+    size=1.8
+  )
+
+```
+
+#Mettre le test de krutal-wallis et le test de wilcoson pour les comparaisons par paire
+
+```{r}
+library(ggpubr)
+
+comparisons <- list(
+  c("CIROB", "JEMU"),
+  c("CIROB", "MUENT"),
+  c("JEMU", "MUENT")
+)
+
+ggplot(df_top10, aes(x = Site, y = Abundance, fill = Site)) +
+  geom_boxplot(outlier.size = 0.8) +
+  facet_wrap(~ Class, scales = "free_y") +
+  theme_bw() +
+  labs(
+    title = "Abondance relative des 10 Classs dominantes selon le site",
+    x = "Site",
+    y = "Abondance relative"
+  ) +
+  theme(
+    plot.title = element_text(size = 8, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 8, face = "bold"),
+    axis.text = element_text(size = 7),
+    strip.text = element_text(size = 8, face = "bold"),
+    legend.position = "right"
+  ) +
+  stat_compare_means(
+    method = "kruskal.test",
+    label = "p.format",
+    label.y.npc = 0.98,
+    size=1.5
+  ) +
+  stat_compare_means(
+    comparisons = comparisons,
+    method = "wilcox.test",
+    label = "p.signif"
+  )
+```
+
+#Analyse de la diversité alpha
+##Normalisation des données en faisant de la rarefaction.
+
+La raréfaction est une technique  statistique utilisée principalement dans les études d'écologie et de biodiversité pour évaluer la richesse et la diversité des espèces au sein d'un échantillon donné. Cela implique la réduction systématique du nombre d’individus dans un échantillon pour créer une série de sous-échantillons, permettant aux chercheurs d’estimer le nombre attendu d’espèces pour différentes tailles d’échantillon. Cette méthode est particulièrement utile pour comparer la biodiversité dans différents environnements ou traitements, car elle permet de standardiser la taille des échantillons, minimisant ainsi les biais pouvant résulter d’efforts d’échantillonnage inégaux. Elle va etre utiliser pour le calcul de la diversité alpha
+
+```{r}
+Gooddata_2 <- rarefy_even_depth(Gooddata_rem, sample.size = min(sample_sums(Gooddata_rem)), rngseed = 123)
+Gooddata
+print_ps(Gooddata)
+
+```
+
+##Diversité alpha en fonction de la variable site
+
+```{r}
+alpha_Gooddata = c("Chao1", "Shannon","InvSimpson")
+
+P <- plot_richness(Gooddata_2, "Site", measures=alpha_Gooddata, color="Site")
+
+# plot data from "D" as a boxplot with ggplot2 plus wilcox.test statistical analysis
+comp <- make_pairs(sample_data(Gooddata_2)$Site)
+
+pdf("Alpha-div_Site7.pdf", #name of file to print. can also include relative or absolute path before filename.
+    width = 12, # define plot width and height. completely up to user.
+    height = 8)
+BR<-P + geom_boxplot(data=P$data , aes(x=Site, color=NULL))+ 
+  stat_compare_means(
+  comparisons = comp,
+  label = "p.format",
+  tip.length = 0.05,
+  method = "wilcox.test",
+  p.adjust.methods="holm")+ 
+  theme(axis.text=element_text(size=14,angle = 0, hjust = 0.5, vjust=0.5),
+        axis.title = element_text(size=14, face="bold"), plot.title =element_text(size=14, face="bold", 
+                                                                                  margin =ggplot2:: margin(t = 0, r = 0, b = 20, l = 0)), strip.text.x = element_text(size=14, face="bold" )) +
+  xlab("Sites")+theme(legend.text=element_text(size=14),
+                                legend.title = element_text(size=14, face="bold"))+
+  theme(legend.position="none")+theme(axis.text.x = element_text(angle=0, hjust = 0.5, vjust=0.5))
+BR
+dev.off()
+ggsave(filename = "Alpha-div_Sites7.png", plot = BR, device = "png",width = 12, height = 8)
+
+```
+
+#Analyse de la diversité Béta:PCoa,test de permanova, classification hiérachique de Bray-curtis, analyse différentielle avec DEseq (Barplot, volcanoplot), Co-occurence
+
+```{r}
+library(phyloseq)
+library(vegan)
+library(dendextend)
+
+otu_mat <- as(otu_table(Gooddata), "matrix")
+
+if (taxa_are_rows(Gooddata)) {
+  otu_mat <- t(otu_mat)
+}
+
+dist_bray <- vegdist(otu_mat, method = "bray")
+hc <- hclust(dist_bray, method = "average")
+
+# Transformer en dendrogramme
+dend <- as.dendrogram(hc)
+
+# Colorer les branches en coupant en k groupes
+dend_col <- color_branches(dend, k = 8)
+
+pdf("Clustering_hierarchique_colore2.pdf", width = 16, height = 8)
+plot(dend_col,
+     main = "Clustering hiérarchique des échantillons (Bray-Curtis)",
+     ylab = "Distance")
+dev.off()
+
+png("Clustering_hierarchique_colore2.png", width = 1800, height = 800, res = 150)
+plot(dend_col,
+     main = "Clustering hiérarchique des échantillons (Bray-Curtis)",
+     ylab = "Distance")
+dev.off()
+```
+
+La prévalence compte le nombre d'échantillons ou un taxon est présent. un filtrage a 5% permet de voir si les données sont homogènes ou hétérogènes.
+
+```{r}
+prevdf = apply(X = otu_table(Gooddata),
+               MARGIN = ifelse(taxa_are_rows(Gooddata), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(Gooddata),
+                    tax_table(Gooddata))
+
+
+###Prevalence Filtering to make threshold of taxa###
+##Taxa filtering##
+##les fonctions ci-dessous ont éliminé bcp de taxa; c'est justement l'idée de cette approche. 
+#The following uses five percent of all samples as the prevalence threshold.
+
+# Define prevalence threshold as 5% of total samples
+prevalenceThreshold = 0.05 * nsamples(Gooddata)
+prevalenceThreshold
+# Execute prevalence filter, using `prune_taxa()` function
+keepTaxa = rownames(prevdf)[(prevdf$Prevalence >= prevalenceThreshold)]
+ps = prune_taxa(keepTaxa, Gooddata)
+ps
+Gooddata2<-ps
+Gooddata2
+print_ps(Gooddata2)
+
+```
+
+##PCoA en fonction des sites
+
+```{r}
+Gooddata_pcoa <- ordinate(
+  physeq = Gooddata2, 
+  method = "PCoA", 
+  distance = "bray"
+)
+
+# Méthode manuelle - extraction des données
+# Extraire les scores PCoA
+pcoa_scores <- as.data.frame(Gooddata_pcoa$vectors[, 1:2])
+colnames(pcoa_scores) <- c("PCoA1", "PCoA2")
+
+# Extraire les métadonnées
+metadata <- data.frame(sample_data(Gooddata2))
+
+# Combiner les données
+plot_data <- cbind(pcoa_scores, Site = metadata$Site)
+
+# Calculer les pourcentages de variance expliquée
+variance_explained <- round(100 * Gooddata_pcoa$values$Eigenvalues[1:2] / sum(Gooddata_pcoa$values$Eigenvalues), 1)
+col_vector <- c("CIROB" = "red", "JEMU" = "green")
+# Créer le graphique manuellement
+Deg <- ggplot(plot_data, aes(x = PCoA1, y = PCoA2, color = as.factor(Site))) +
+  geom_point(size = 4) +
+  scale_color_manual(
+    values = col_vector,
+    name = "Sites"
+  ) +
+  labs(
+    x = paste0("PCoA1 (", variance_explained[1], "%)"),
+    y = paste0("PCoA2 (", variance_explained[2], "%)"),
+    title = "Site",
+    color = "Site"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text = element_text(size = 14, angle = 0, hjust = 0.5, vjust = 0.5), 
+    axis.title = element_text(size = 14, face = "bold"), 
+    plot.title = element_text(size = 14, face = "bold", 
+                              margin = margin(t = 0, r = 0, b = 20, l = 0)),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 14, face = "bold")
+  ) +
+
+  annotate(
+    "text",
+    x = -0.53,
+    y = 0.3,
+    size = 4,
+    label =
+"
+R² = 33.3 %
+p = 0.001",
+    size = 10,
+    hjust = 0,
+  )
+Deg 
+
+# Afficher le gra
+```
+
+
+```{r}
+ggsave(filename = "Deg.png", plot = Deg, device = "png", width = 12, height = 10)
+```
+
+##Test de permanova
+
+```{r}
+library(vegan)
+
+dist <- phyloseq::distance(Gooddata2, method = "bray")
+meta <- data.frame(sample_data(Gooddata2))
+
+adonis_result2<-adonis2(dist ~ Site, data = meta)
+adonis_result2
+```
+```{r}
+adonis_result3<-adonis2(dist ~ Espece, data = meta)
+```
+
+```{r}
+adonis2(dist ~ Site*Espece,
+        data = meta,
+        by = "terms")
+```
+
+
+```{r}
+p_value <- adonis_result2$`Pr(>F)`[1]
+Rc <- (adonis_result2$`R2`[1])*100
+pdf("Ab.pdf", 
+    width = 10, 
+    height = 8)
+Deg <- Deg + 
+  annotate("text", x = min(plot_data$PCoA1), y = max(plot_data$PCoA2),
+           label = sprintf("p =", round(p_value, 4),
+                         "R2 = ",round(Rc, 1)),
+           hjust = 0, vjust = 1, size = 5, fontface = "bold")
+
+print(Deg)
+dev.off()
+```
+```{r}
+p_value <- adonis_result$`Pr(>F)`[1]
+R2_value <- adonis_result$R2[1]
+
+pdf("Deg.pdf", width = 10, height = 8)
+
+Deg <- Deg +
+  annotate("text",
+           x = min(plot_data$PCoA1),
+           y = max(plot_data$PCoA2),
+           label = paste("PERMANOVA p =", round(p_value, 4),
+                         "\nR² =", round(R2_value, 3)),
+           hjust = 0, vjust = 1, size = 5, fontface = "bold")
+
+```
+
+
+```{r}
+print_ps(Gooddata2)
+```
+
+## Ajouter la valeur p au graphique
+```{r}
+p_value <- adonis_result2$`Pr(>F)`[1]
+pdf("PcoA_Black_resin.pdf", 
+    width = 10, 
+    height = 8)
+BR <- BR + 
+  annotate("text", x = min(plot_data$PCoA1), y = max(plot_data$PCoA2),
+           label = paste("PERMANOVA p =", round(p_value, 4)),
+           hjust = 0, vjust = 1, size = 5, fontface = "bold")
+
+print(BR)
+dev.off()
+
+```
+
+
+#Analyse différentielles DESeq (pour P. vulgaris et G. rotundifolium) permettant d'avoir un barplot
+
+```{r}
+library(phyloseq)
+library(DESeq2)
+library(dplyr)
+library(ggplot2)
+
+# =========================
+# Analyse différentielle DESeq2 : Espece
+# Barplot uniquement
+# =========================
+
+alpha <- 0.05
+top_n <- 10
+
+# 1. Définir Espece comme facteur
+sample_data(Gooddata2)$Espece <- as.factor(sample_data(Gooddata2)$Espece)
+
+# Référence : G.rotundifolium
+sample_data(Gooddata2)$Espece <- relevel(
+  sample_data(Gooddata2)$Espece,
+  ref = "G.rotundifolium"
+)
+
+# 2. Agrégation au niveau Genus
+ps.taxa <- tax_glom(Gooddata2, taxrank = "Genus", NArm = FALSE)
+
+# 3. Supprimer les genres non assignés
+ps.taxa <- prune_taxa(
+  !is.na(as.vector(tax_table(ps.taxa)[, "Genus"])) &
+    as.vector(tax_table(ps.taxa)[, "Genus"]) != "",
+  ps.taxa
+)
+
+# 4. Garder seulement les deux espèces
+ps.taxa.sub <- subset_samples(
+  ps.taxa,
+  Espece %in% c("G.rotundifolium", "P.vulgaris")
+)
+
+# 5. Filtrer les taxons rares (> 90 % de zéros)
+otu_mat <- as(otu_table(ps.taxa.sub), "matrix")
+
+if (!taxa_are_rows(ps.taxa.sub)) {
+  otu_mat <- t(otu_mat)
+}
+
+keep_taxa <- rowSums(otu_mat == 0) < ncol(otu_mat) * 0.9
+ps.taxa.pse.sub <- prune_taxa(keep_taxa, ps.taxa.sub)
+
+# 6. Conversion DESeq2
+ps_ds <- phyloseq_to_deseq2(ps.taxa.pse.sub, ~ Espece)
+
+# 7. Normalisation et analyse
+ds <- estimateSizeFactors(ps_ds, type = "poscounts")
+ds <- DESeq(ds, test = "Wald", fitType = "parametric")
+
+# 8. Résultats : P.vulgaris vs G.rotundifolium
+res <- results(
+  ds,
+  contrast = c("Espece", "P.vulgaris", "G.rotundifolium"),
+  alpha = alpha
+)
+
+# 9. Construire le dataframe
+res_df <- as.data.frame(res)
+res_df$ASV <- rownames(res_df)
+
+tax_df <- as.data.frame(tax_table(ps.taxa.pse.sub))
+tax_df$ASV <- rownames(tax_df)
+
+res_df <- left_join(res_df, tax_df, by = "ASV")
+
+# 10. Nettoyage
+res_df <- res_df %>%
+  mutate(
+    padj = as.numeric(padj),
+    log2FoldChange = as.numeric(log2FoldChange),
+    Genus = as.character(Genus)
+  ) %>%
+  filter(
+    !is.na(padj),
+    !is.na(log2FoldChange),
+    !is.na(Genus),
+    Genus != ""
+  ) %>%
+  distinct(Genus, .keep_all = TRUE)
+
+# 11. Sélection des top genres positifs et négatifs
+top_pos <- res_df %>%
+  filter(log2FoldChange > 0) %>%
+  arrange(desc(log2FoldChange)) %>%
+  slice_head(n = 12)
+
+top_neg <- res_df %>%
+  filter(log2FoldChange < 0) %>%
+  arrange(log2FoldChange) %>%
+  slice_head(n = 13)
+
+barplot_data <- bind_rows(top_pos, top_neg) %>%
+  mutate(
+    Significatif = ifelse(padj < alpha, "Significant", "Not significant"),
+    Enriched_in = ifelse(
+      log2FoldChange > 0,
+      "P.vulgaris",
+      "G.rotundifolium"
+    )
+  ) %>%
+  arrange(log2FoldChange)
+
+# 12. Barplot final
+barplot_deseq <- ggplot(
+  barplot_data,
+  aes(
+    x = reorder(Genus, log2FoldChange),
+    y = log2FoldChange,
+    fill = Significatif
+  )
+) +
+  geom_col(width = 0.7) +
+  geom_text(
+    aes(
+      label = sprintf("%.2f", log2FoldChange),
+      y = ifelse(
+        log2FoldChange >= 0,
+        log2FoldChange + 0.05 * max(abs(log2FoldChange), na.rm = TRUE),
+        log2FoldChange - 0.05 * max(abs(log2FoldChange), na.rm = TRUE)
+      )
+    ),
+    size = 3,
+    fontface = "bold"
+  ) +
+  geom_hline(
+    yintercept = 0,
+    color = "black",
+    linewidth = 0.5
+  ) +
+  coord_flip() +
+  scale_fill_manual(
+    values = c(
+      "Significant" = "blue",
+      "Not significant" = "red"
+    )
+  ) +
+  labs(
+    title = "Top 25 differential eukaryotic genera according to plant species",
+    x = "Eukaryotic genus",
+    y = "Log2 Fold Change (P.vulgaris vs G.rotundifolium)",
+    fill = paste0("padj < ", alpha)
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 12),
+    axis.title = element_text(size = 11, face = "bold"),
+    axis.text.y = element_text(size = 8),
+    legend.position = "bottom"
+  )
+
+barplot_deseq
+```
+
+```{r}
+ggsave( filename = "DESeq_barplot.png", plot = barplot_deseq, width = 8, height = 5, units = "in", dpi = 300 )
+```
+
+# Analyse de cooccurence
+```{r}
+library(phyloseq)
+library(microbiome)
+library(ggplot2)
+
+# ================================
+# Cooccurrence site JEMU
+# ================================
+
+# Sous-échantillonnage du site JEMU
+Gooddata2_JEMU <- subset_samples(Gooddata2, Site == "JEMU")
+Gooddata2_JEMU <- prune_taxa(taxa_sums(Gooddata2_JEMU) > 0, Gooddata2_JEMU)
+
+# Vérification
+if (nsamples(Gooddata2_JEMU) < 4) {
+  stop("Pas assez d’échantillons pour JEMU")
+}
+
+# 1️⃣ Agrégation Genus
+ps.genus <- microbiome::aggregate_taxa(Gooddata2_JEMU, "Genus")
+
+# 2️⃣ Abondance relative
+ps.rel <- microbiome::transform(ps.genus, "compositional")
+
+# 3️⃣ Top 10 taxa
+ntop <- min(10, ntaxa(ps.rel))
+ps.top <- prune_taxa(
+  names(sort(taxa_sums(ps.rel), decreasing = TRUE))[1:ntop],
+  ps.rel
+)
+
+# 4️⃣ Matrice
+x <- as(t(otu_table(ps.top)), "matrix")
+
+# 5️⃣ Filtrage
+x <- x[, colSums(x > 0) >= 3, drop = FALSE]
+x <- x[, apply(x, 2, var) > 0, drop = FALSE]
+
+if (ncol(x) < 2) {
+  stop("Pas assez de taxa variables pour JEMU")
+}
+
+# 6️⃣ Corrélations
+correlations <- microbiome::associate(
+  x,
+  method = "spearman",
+  mode = "table",
+  p.adj.threshold = 0.05
+)
+
+if (nrow(correlations) == 0) {
+  stop("Aucune corrélation significative pour JEMU")
+}
+
+# 7️⃣ Heatmap
+p_JEMU <- microbiome::heat(
+  correlations,
+  "X1", "X2",
+  fill = "Correlation",
+  star = "p.adj",
+  p.adj.threshold = 0.05,
+  association.threshold = 0.5,
+  order.rows = TRUE,
+  legend.text = "Corrélation",
+  star.size = 5
+) +
+  ggtitle("Network of correlations - Site JEMU") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# 8️⃣ Export
+pdf("Cooccurence_JEMU.pdf", width = 16, height = 9)
+print(p_JEMU)
+dev.off()
+```
+
+```{r}
+# ================================
+# Cooccurrence site MUENT
+# ================================
+
+# Sous-échantillonnage du site MUENT
+Gooddata2_MUENT <- subset_samples(Gooddata2, Site == "MUENT")
+Gooddata2_MUENT <- prune_taxa(taxa_sums(Gooddata2_MUENT) > 0, Gooddata2_MUENT)
+
+# Vérification
+if (nsamples(Gooddata2_JEMU) < 4) {
+  stop("Pas assez d’échantillons pour MUENT")
+}
+
+# 1️⃣ Agrégation Genus
+ps.genus <- microbiome::aggregate_taxa(Gooddata2_MUENT, "Genus")
+
+# 2️⃣ Abondance relative
+ps.rel <- microbiome::transform(ps.genus, "compositional")
+
+# 3️⃣ Top 10 taxa
+ntop <- min(10, ntaxa(ps.rel))
+ps.top <- prune_taxa(
+  names(sort(taxa_sums(ps.rel), decreasing = TRUE))[1:ntop],
+  ps.rel
+)
+
+# 4️⃣ Matrice
+x <- as(t(otu_table(ps.top)), "matrix")
+
+# 5️⃣ Filtrage
+x <- x[, colSums(x > 0) >= 3, drop = FALSE]
+x <- x[, apply(x, 2, var) > 0, drop = FALSE]
+
+if (ncol(x) < 2) {
+  stop("Pas assez de taxa variables pour MUENT")
+}
+
+# 6️⃣ Corrélations
+correlations <- microbiome::associate(
+  x,
+  method = "spearman",
+  mode = "table",
+  p.adj.threshold = 0.05
+)
+
+if (nrow(correlations) == 0) {
+  stop("Aucune corrélation significative pour MUENT")
+}
+
+# 7️⃣ Heatmap
+p_MUENT <- microbiome::heat(
+  correlations,
+  "X1", "X2",
+  fill = "Correlation",
+  star = "p.adj",
+  p.adj.threshold = 0.05,
+  association.threshold = 0.5,
+  order.rows = TRUE,
+  legend.text = "Corrélation",
+  star.size = 5
+) +
+  ggtitle("Network of correlations - Site MUENT") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# 8️⃣ Export
+pdf("Cooccurence_MUENT.pdf", width = 16, height = 9)
+print(p_MUENT)
+dev.off()
+```
+
+```{r}
+# ================================
+# Cooccurrence site CIROB
+# ================================
+
+# Sous-échantillonnage du site CIROB
+Gooddata2_CIROB <- subset_samples(Gooddata2, Site == "CIROB")
+Gooddata2_CIROB <- prune_taxa(taxa_sums(Gooddata2_CIROB) > 0, Gooddata2_CIROB)
+
+# Vérification
+if (nsamples(Gooddata2_CIROB) < 4) {
+  stop("Pas assez d’échantillons pour CIROB")
+}
+
+# 1️⃣ Agrégation Genus
+ps.genus <- microbiome::aggregate_taxa(Gooddata2_CIROB, "Genus")
+
+# 2️⃣ Abondance relative
+ps.rel <- microbiome::transform(ps.genus, "compositional")
+
+# 3️⃣ Top 10 taxa
+ntop <- min(10, ntaxa(ps.rel))
+ps.top <- prune_taxa(
+  names(sort(taxa_sums(ps.rel), decreasing = TRUE))[1:ntop],
+  ps.rel
+)
+
+# 4️⃣ Matrice
+x <- as(t(otu_table(ps.top)), "matrix")
+
+# 5️⃣ Filtrage
+x <- x[, colSums(x > 0) >= 3, drop = FALSE]
+x <- x[, apply(x, 2, var) > 0, drop = FALSE]
+
+if (ncol(x) < 2) {
+  stop("Pas assez de taxa variables pour MUENT")
+}
+
+# 6️⃣ Corrélations
+correlations <- microbiome::associate(
+  x,
+  method = "spearman",
+  mode = "table",
+  p.adj.threshold = 0.05
+)
+
+if (nrow(correlations) == 0) {
+  stop("Aucune corrélation significative pour CIROB")
+}
+
+# 7️⃣ Heatmap
+p_CIROB <- microbiome::heat(
+  correlations,
+  "X1", "X2",
+  fill = "Correlation",
+  star = "p.adj",
+  p.adj.threshold = 0.05,
+  association.threshold = 0.5,
+  order.rows = TRUE,
+  legend.text = "Corrélation",
+  star.size = 5
+) +
+  ggtitle("Network of correlations - Site CIROB") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# 8️⃣ Export
+pdf("Cooccurence_CIROB.pdf", width = 16, height = 9)
+print(p_CIROB)
+dev.off()
+```
+
+```{r}
+# ================================
+# Cooccurrence P.vulgaris
+# ================================
+
+# Sous-échantillonnage de l'espèce P.vulgaris
+Gooddata2_P.vulgaris <- subset_samples(Gooddata2, Espece == "P.vulgaris")
+Gooddata2_P.vulgaris<- prune_taxa(taxa_sums(Gooddata2_P.vulgaris) > 0, Gooddata2_P.vulgaris)
+
+# Vérification
+if (nsamples(Gooddata2_P.vulgaris) < 4) {
+  stop("Pas assez d’échantillons pour CIROB")
+}
+
+# 1️⃣ Agrégation Genus
+ps.genus <- microbiome::aggregate_taxa(Gooddata2_P.vulgaris, "Genus")
+
+# 2️⃣ Abondance relative
+ps.rel <- microbiome::transform(ps.genus, "compositional")
+
+# 3️⃣ Top 10 taxa
+ntop <- min(10, ntaxa(ps.rel))
+ps.top <- prune_taxa(
+  names(sort(taxa_sums(ps.rel), decreasing = TRUE))[1:ntop],
+  ps.rel
+)
+
+# 4️⃣ Matrice
+x <- as(t(otu_table(ps.top)), "matrix")
+
+# 5️⃣ Filtrage
+x <- x[, colSums(x > 0) >= 3, drop = FALSE]
+x <- x[, apply(x, 2, var) > 0, drop = FALSE]
+
+if (ncol(x) < 2) {
+  stop("Pas assez de taxa variables pour P.vulgaris")
+}
+
+# 6️⃣ Corrélations
+correlations <- microbiome::associate(
+  x,
+  method = "spearman",
+  mode = "table",
+  p.adj.threshold = 0.05
+)
+
+if (nrow(correlations) == 0) {
+  stop("Aucune corrélation significative pour P.vulgaris")
+}
+
+# 7️⃣ Heatmap
+p_P.vulgaris <- microbiome::heat(
+  correlations,
+  "X1", "X2",
+  fill = "Correlation",
+  star = "p.adj",
+  p.adj.threshold = 0.05,
+  association.threshold = 0.5,
+  order.rows = TRUE,
+  legend.text = "Corrélation",
+  star.size = 5
+) +
+  ggtitle("Network of correlations - espèce P.vulgaris") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# 8️⃣ Export
+pdf("Cooccurence_P.vulgaris.pdf", width = 16, height = 9)
+print(p_P.vulgaris)
+dev.off()
+```
+
+```{r}
+# ================================
+# Cooccurrence l'espèce G.rotundifolium
+# ================================
+
+# Sous-échantillonnage de l'espèce G.rotundifolium
+Gooddata2_G.rotundifolium <- subset_samples(Gooddata2, Espece == "G.rotundifolium")
+Gooddata2_G.rotundifolium <- prune_taxa(taxa_sums(Gooddata2_G.rotundifolium) > 0, Gooddata2_G.rotundifolium)
+
+# Vérification
+if (nsamples(Gooddata2_G.rotundifolium) < 4) {
+  stop("Pas assez d’échantillons pour G.rotundifolium")
+}
+
+# 1️⃣ Agrégation Genus
+ps.genus <- microbiome::aggregate_taxa(Gooddata2_G.rotundifolium, "Genus")
+
+# 2️⃣ Abondance relative
+ps.rel <- microbiome::transform(ps.genus, "compositional")
+
+# 3️⃣ Top 10 taxa
+ntop <- min(10, ntaxa(ps.rel))
+ps.top <- prune_taxa(
+  names(sort(taxa_sums(ps.rel), decreasing = TRUE))[1:ntop],
+  ps.rel
+)
+
+# 4️⃣ Matrice
+x <- as(t(otu_table(ps.top)), "matrix")
+
+# 5️⃣ Filtrage
+x <- x[, colSums(x > 0) >= 3, drop = FALSE]
+x <- x[, apply(x, 2, var) > 0, drop = FALSE]
+
+if (ncol(x) < 2) {
+  stop("Pas assez de taxa variables pour G.rotundifolium")
+}
+
+# 6️⃣ Corrélations
+correlations <- microbiome::associate(
+  x,
+  method = "spearman",
+  mode = "table",
+  p.adj.threshold = 0.05
+)
+
+if (nrow(correlations) == 0) {
+  stop("Aucune corrélation significative pour G.rotundifolium")
+}
+
+# 7️⃣ Heatmap
+p_G.rotundifolium <- microbiome::heat(
+  correlations,
+  "X1", "X2",
+  fill = "Correlation",
+  star = "p.adj",
+  p.adj.threshold = 0.05,
+  association.threshold = 0.5,
+  order.rows = TRUE,
+  legend.text = "Corrélation",
+  star.size = 5
+) +
+  ggtitle("Network of correlations - G.rotundifolium") +
+  theme_bw() +
+  theme(
+    text = element_text(size = 14),
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+    axis.title = element_text(size = 12, face = "bold"),
+    plot.title = element_text(size = 14, face = "bold"),
+    legend.position = "bottom"
+  )
+
+# 8️⃣ Export
+pdf("Cooccurence_G.rotundifolium.pdf", width = 16, height = 9)
+print(p_G.rotundifolium)
+dev.off()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
